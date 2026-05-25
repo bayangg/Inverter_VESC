@@ -1,12 +1,9 @@
 /*
  * hw_kai.c
- *
- * Implementasi fungsi hardware untuk KAI INVERTER
- * Pasangan dari hw_kai.h
- *
- * Fungsi utama yang WAJIB ada:
- *   hw_init_gpio()      -> setup semua pin GPIO
- *   hw_setup_adc_channels() -> mapping ADC channel
+ * Implementasi hardware untuk KAI INVERTER FUEL PUMP
+ * Project  : 2509-KAI-PIFP-A
+ * MCU      : STM32F405RGT6
+ * Driver   : IR2110 (3 buah, satu per fase)
  */
 
 #include "hw.h"
@@ -14,132 +11,295 @@
 #include "ch.h"
 #include "hal.h"
 #include "stm32f4xx_conf.h"
-#include "utils.h"
-#include "mcpwm_foc.h"    
-#include "mc_interface.h"  
+#include "utils_math.h"
+#include "terminal.h"
+#include "mc_interface.h"
 #include <math.h>
 
 // =========================================================
+// I2C state
+// =========================================================
+static volatile bool i2c_running = false;
+
+static const I2CConfig i2cfg = {
+    OPMODE_I2C,
+    100000,
+    STD_DUTY_CYCLE
+};
+
+// =========================================================
 // hw_init_gpio()
-// Dipanggil saat boot, setup semua pin
+// Setup semua pin GPIO saat boot
 // =========================================================
 void hw_init_gpio(void) {
 
-    // EN_GATE - enable gate driver IR2110
-    palSetPadMode(GPIOB, 5, PAL_MODE_OUTPUT_PUSHPULL);
-    palSetPad(GPIOB, 5); // HIGH = enable
+    // Enable GPIO clock semua port yang dipakai
+    RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOA, ENABLE);
+    RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB, ENABLE);
+    RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOC, ENABLE);
+    RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOD, ENABLE);
 
-    // LED
-    palSetPadMode(LED_RED_GPIO, LED_RED_PIN, PAL_MODE_OUTPUT_PUSHPULL);
-    palSetPadMode(LED_GREEN_GPIO, LED_GREEN_PIN, PAL_MODE_OUTPUT_PUSHPULL);
-    LED_RED_OFF();
+    // -------------------------------------------------
+    // EN_GATE -> PB5
+    // IR2110 SD pin: HIGH = enable gate driver
+    // Set output dulu, lalu enable
+    // -------------------------------------------------
+    palSetPadMode(GPIOB, 5,
+            PAL_MODE_OUTPUT_PUSHPULL |
+            PAL_STM32_OSPEED_HIGHEST);
+    ENABLE_GATE();
+
+    // -------------------------------------------------
+    // LED -> PB0 (GREEN), PB1 (RED)
+    // -------------------------------------------------
+    palSetPadMode(LED_GREEN_GPIO, LED_GREEN_PIN,
+            PAL_MODE_OUTPUT_PUSHPULL |
+            PAL_STM32_OSPEED_HIGHEST);
+    palSetPadMode(LED_RED_GPIO, LED_RED_PIN,
+            PAL_MODE_OUTPUT_PUSHPULL |
+            PAL_STM32_OSPEED_HIGHEST);
     LED_GREEN_OFF();
+    LED_RED_OFF();
 
-    // HALL SENSOR INPUT
+    // -------------------------------------------------
+    // PWM output TIM1 (WAJIB - ini yang generate SVPWM)
+    // High side: PA8=UH, PA9=VH, PA10=WH
+    // Low side:  PB13=UL, PB14=VL, PB15=WL
+    // -------------------------------------------------
+    palSetPadMode(GPIOA, 8,  PAL_MODE_ALTERNATE(GPIO_AF_TIM1) |
+            PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_FLOATING);
+    palSetPadMode(GPIOA, 9,  PAL_MODE_ALTERNATE(GPIO_AF_TIM1) |
+            PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_FLOATING);
+    palSetPadMode(GPIOA, 10, PAL_MODE_ALTERNATE(GPIO_AF_TIM1) |
+            PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_FLOATING);
+    palSetPadMode(GPIOB, 13, PAL_MODE_ALTERNATE(GPIO_AF_TIM1) |
+            PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_FLOATING);
+    palSetPadMode(GPIOB, 14, PAL_MODE_ALTERNATE(GPIO_AF_TIM1) |
+            PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_FLOATING);
+    palSetPadMode(GPIOB, 15, PAL_MODE_ALTERNATE(GPIO_AF_TIM1) |
+            PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_FLOATING);
+
+    // -------------------------------------------------
+    // Hall sensor -> PC6, PC7, PC8
+    // -------------------------------------------------
     palSetPadMode(HW_HALL_ENC_GPIO1, HW_HALL_ENC_PIN1, PAL_MODE_INPUT_PULLUP);
     palSetPadMode(HW_HALL_ENC_GPIO2, HW_HALL_ENC_PIN2, PAL_MODE_INPUT_PULLUP);
     palSetPadMode(HW_HALL_ENC_GPIO3, HW_HALL_ENC_PIN3, PAL_MODE_INPUT_PULLUP);
 
-    // UART TX/RX pins
+    // -------------------------------------------------
+    // ADC pins - set ke mode analog
+    //
+    // PC0=CH10 (I_U), PC1=CH11 (I_V), PC2=CH12 (I_W)
+    // PA0=CH0  (SENS1/back-EMF U)
+    // PA1=CH1  (SENS2/back-EMF V)
+    // PA2=CH2  (SENS3/back-EMF W)
+    // PA3=CH3  (NTC_1/TEMP_MOS)
+    // PA5=CH5  (EXT)
+    // PA6=CH6  (EXT2)
+    // PC3=CH13 (spare)
+    // PC4=CH14 (NTC_2/TEMP_MOTOR)
+    // PC5=CH15 (VOLT_INPUT/VIN_SENS)
+    // -------------------------------------------------
+    palSetPadMode(GPIOC, 0, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 1, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 2, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 3, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 4, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 5, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 0, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 1, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 2, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 3, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 5, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 6, PAL_MODE_INPUT_ANALOG);
+
+    // -------------------------------------------------
+    // UART TX/RX -> PC10, PC11 (USART3)
+    // -------------------------------------------------
     palSetPadMode(HW_UART_TX_PORT, HW_UART_TX_PIN,
-                  PAL_MODE_ALTERNATE(GPIO_AF_USART3) |
-                  PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_PULLUP);
+            PAL_MODE_ALTERNATE(GPIO_AF_USART3) |
+            PAL_STM32_OSPEED_HIGHEST |
+            PAL_STM32_PUDR_PULLUP);
     palSetPadMode(HW_UART_RX_PORT, HW_UART_RX_PIN,
-                  PAL_MODE_ALTERNATE(GPIO_AF_USART3) |
-                  PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_PULLUP);
+            PAL_MODE_ALTERNATE(GPIO_AF_USART3) |
+            PAL_STM32_OSPEED_HIGHEST |
+            PAL_STM32_PUDR_PULLUP);
+
+    // -------------------------------------------------
+    // CAN -> PB8 (RX), PB9 (TX)
+    // -------------------------------------------------
+    palSetPadMode(HW_CANRX_PORT, HW_CANRX_PIN,
+            PAL_MODE_ALTERNATE(GPIO_AF_CAN1) |
+            PAL_STM32_OSPEED_HIGHEST);
+    palSetPadMode(HW_CANTX_PORT, HW_CANTX_PIN,
+            PAL_MODE_ALTERNATE(GPIO_AF_CAN1) |
+            PAL_STM32_OSPEED_HIGHEST);
 }
 
 // =========================================================
 // hw_setup_adc_channels()
-// Mapping sinyal sensor ke ADC channel STM32F405
+// Mapping ADC channel ke ADC_Value[] array
 //
-// STM32F405 punya 3 ADC (ADC1, ADC2, ADC3)
-// VESC sampling secara sinkron semua channel sekaligus
-// urutan sampling harus sesuai urutan di ADC_Value[]
+// Pola VESC: ADC1/ADC2/ADC3 sampling simultan
+// Setiap "rank" (slot) di ketiga ADC dibaca bersamaan
+// Hasil disimpan ke ADC_Value[] secara berurutan:
+//   slot1: [ADC1r1, ADC2r1, ADC3r1] -> index 0,1,2
+//   slot2: [ADC1r2, ADC2r2, ADC3r2] -> index 3,4,5
+//   slot3: [ADC1r3, ADC2r3, ADC3r3] -> index 6,7,8
+//   slot4: [ADC1r4, ADC2r4, ADC3r4] -> index 9,10,11
+//   slot5: [ADC1r5, ADC2r5, ADC3r5] -> index 12,13,14
 //
-// VERIFIKASI pin ADC dari skematik MCU-mu sebelum compile!
+// Injected channel (untuk current sampling saat switching):
+//   ADC1/2/3 injected -> sama dengan rank1 (current U/V/W)
 // =========================================================
 void hw_setup_adc_channels(void) {
+    uint8_t t_samp = ADC_SampleTime_15Cycles;
 
-    // --- ADC1 regular channels ---
-    // Slot 1: Current U (I_U)
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_0,  1, ADC_SampleTime_15Cycles);
-    // Slot 2: Current V (I_V)  
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_1,  2, ADC_SampleTime_15Cycles);
-    // Slot 3: Voltage input (VOLT_INPUT 72V)
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_5,  3, ADC_SampleTime_15Cycles);
-    // Slot 4: NTC temp 1 (NTC_1)
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_14, 4, ADC_SampleTime_15Cycles);
-    // Slot 5: Internal Vrefint
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_Vrefint, 5, ADC_SampleTime_15Cycles);
+    // --- SLOT 1: Current sensing (injected juga disini) ---
+    // ADC_IND_CURR1=0: PC0=CH10 -> I_U
+    // ADC_IND_CURR2=1: PC1=CH11 -> I_V
+    // ADC_IND_CURR3=2: PC2=CH12 -> I_W
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_10, 1, t_samp);
+    ADC_RegularChannelConfig(ADC2, ADC_Channel_11, 1, t_samp);
+    ADC_RegularChannelConfig(ADC3, ADC_Channel_12, 1, t_samp);
 
-    // --- ADC2 regular channels ---
-    // Slot 1: Current V (I_V) - dual sampling
-    ADC_RegularChannelConfig(ADC2, ADC_Channel_1,  1, ADC_SampleTime_15Cycles);
-    // Slot 2: Current W (I_W)
-    ADC_RegularChannelConfig(ADC2, ADC_Channel_2,  2, ADC_SampleTime_15Cycles);
-    // Slot 3: NTC temp 2 (NTC_2)
-    ADC_RegularChannelConfig(ADC2, ADC_Channel_15, 3, ADC_SampleTime_15Cycles);
-    // Slot 4: SENS1 (back-EMF phase U, jika dipakai)
-    ADC_RegularChannelConfig(ADC2, ADC_Channel_8,  4, ADC_SampleTime_15Cycles);
-    // Slot 5: SENS2 (back-EMF phase V, jika dipakai)
-    ADC_RegularChannelConfig(ADC2, ADC_Channel_9,  5, ADC_SampleTime_15Cycles);
+    // --- SLOT 2: Back-EMF / SENS ---
+    // ADC_IND_SENS1=3: PA0=CH0  -> SENS1 (back-EMF U)
+    // ADC_IND_SENS2=4: PA1=CH1  -> SENS2 (back-EMF V)
+    // ADC_IND_SENS3=5: PA2=CH2  -> SENS3 (back-EMF W)
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_0,  2, t_samp);
+    ADC_RegularChannelConfig(ADC2, ADC_Channel_1,  2, t_samp);
+    ADC_RegularChannelConfig(ADC3, ADC_Channel_2,  2, t_samp);
 
-    // --- ADC3 regular channels ---
-    // Slot 1: Current W (I_W) - triple sampling  
-    ADC_RegularChannelConfig(ADC3, ADC_Channel_2,  1, ADC_SampleTime_15Cycles);
-    // Slot 2: SENS3 (back-EMF phase W, jika dipakai)
-    ADC_RegularChannelConfig(ADC3, ADC_Channel_3,  2, ADC_SampleTime_15Cycles);
-    // Slot 3: Spare
-    ADC_RegularChannelConfig(ADC3, ADC_Channel_10, 3, ADC_SampleTime_15Cycles);
-    // Slot 4: Spare
-    ADC_RegularChannelConfig(ADC3, ADC_Channel_11, 4, ADC_SampleTime_15Cycles);
-    // Slot 5: Spare
-    ADC_RegularChannelConfig(ADC3, ADC_Channel_12, 5, ADC_SampleTime_15Cycles);
+    // --- SLOT 3: EXT / TEMP_MOS ---
+    // ADC_IND_EXT=6:      PA5=CH5  -> spare/external
+    // ADC_IND_EXT2=7:     PA6=CH6  -> spare/external2
+    // ADC_IND_TEMP_MOS=8: PA3=CH3  -> NTC_1 (suhu MOSFET)
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_5,  3, t_samp);
+    ADC_RegularChannelConfig(ADC2, ADC_Channel_6,  3, t_samp);
+    ADC_RegularChannelConfig(ADC3, ADC_Channel_3,  3, t_samp);
+
+    // --- SLOT 4: TEMP_MOTOR / VIN ---
+    // ADC_IND_TEMP_MOTOR=9:  PC4=CH14 -> NTC_2 (suhu motor)
+    // ADC_IND_VIN_SENS=10:   PC5=CH15 -> VOLT_INPUT (72V sense)
+    // index 11:              PC3=CH13 -> spare
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_14, 4, t_samp);
+    ADC_RegularChannelConfig(ADC2, ADC_Channel_15, 4, t_samp);
+    ADC_RegularChannelConfig(ADC3, ADC_Channel_13, 4, t_samp);
+
+    // --- SLOT 5: Vrefint dan spare ---
+    // ADC_IND_VREFINT=12: Vrefint
+    // index 13, 14: spare
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_Vrefint, 5, t_samp);
+    ADC_RegularChannelConfig(ADC2, ADC_Channel_0,       5, t_samp);
+    ADC_RegularChannelConfig(ADC3, ADC_Channel_1,       5, t_samp);
+
+    // --- INJECTED CHANNELS ---
+    // Dipakai untuk current sampling presisi saat center PWM
+    // Harus sama dengan slot 1 regular (current U/V/W)
+    ADC_InjectedChannelConfig(ADC1, ADC_Channel_10, 1, t_samp);
+    ADC_InjectedChannelConfig(ADC2, ADC_Channel_11, 1, t_samp);
+    ADC_InjectedChannelConfig(ADC3, ADC_Channel_12, 1, t_samp);
+    ADC_InjectedChannelConfig(ADC1, ADC_Channel_10, 2, t_samp);
+    ADC_InjectedChannelConfig(ADC2, ADC_Channel_11, 2, t_samp);
+    ADC_InjectedChannelConfig(ADC3, ADC_Channel_12, 2, t_samp);
+    ADC_InjectedChannelConfig(ADC1, ADC_Channel_10, 3, t_samp);
+    ADC_InjectedChannelConfig(ADC2, ADC_Channel_11, 3, t_samp);
+    ADC_InjectedChannelConfig(ADC3, ADC_Channel_12, 3, t_samp);
 }
 
 // =========================================================
-// hw_start_i2c() - jika pakai I2C (sensor NTC via I2C)
+// hw_start_i2c()
 // =========================================================
 void hw_start_i2c(void) {
-    // Kamu punya I2C di skematik (SCL/SDA ke F405)
-    // Implement jika ada sensor I2C yang dipakai
-    // Kalau NTC pakai ADC langsung, fungsi ini kosong saja
+    i2cAcquireBus(&HW_I2C_DEV);
+
+    if (!i2c_running) {
+        palSetPadMode(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN,
+                PAL_MODE_ALTERNATE(HW_I2C_GPIO_AF) |
+                PAL_STM32_OTYPE_OPENDRAIN |
+                PAL_STM32_OSPEED_MID1 |
+                PAL_STM32_PUDR_PULLUP);
+        palSetPadMode(HW_I2C_SDA_PORT, HW_I2C_SDA_PIN,
+                PAL_MODE_ALTERNATE(HW_I2C_GPIO_AF) |
+                PAL_STM32_OTYPE_OPENDRAIN |
+                PAL_STM32_OSPEED_MID1 |
+                PAL_STM32_PUDR_PULLUP);
+
+        i2cStart(&HW_I2C_DEV, &i2cfg);
+        i2c_running = true;
+    }
+
+    i2cReleaseBus(&HW_I2C_DEV);
 }
 
+// =========================================================
+// hw_stop_i2c()
+// =========================================================
 void hw_stop_i2c(void) {
-    // kosong
+    i2cAcquireBus(&HW_I2C_DEV);
+
+    if (i2c_running) {
+        palSetPadMode(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN, PAL_MODE_INPUT);
+        palSetPadMode(HW_I2C_SDA_PORT, HW_I2C_SDA_PIN, PAL_MODE_INPUT);
+
+        i2cStop(&HW_I2C_DEV);
+        i2c_running = false;
+    }
+
+    i2cReleaseBus(&HW_I2C_DEV);
 }
 
 // =========================================================
-// hw_get_temp() - baca temperatur MOSFET
+// hw_try_restore_i2c()
+// Dipanggil VESC saat I2C bus hang
 // =========================================================
-float hw_get_temp(void) {
-    // Return dummy value dulu
-    // Nanti bisa diimplementasikan setelah ADC jalan
-    return 25.0;
-}
-
-
 void hw_try_restore_i2c(void) {
-    // kosong - tidak pakai nunchuk
-}
+    if (i2c_running) {
+        i2cAcquireBus(&HW_I2C_DEV);
 
-// =========================================================
-// CATATAN TODO sebelum compile:
-//
-// 1. VERIFIKASI semua ADC channel number dari datasheet
-//    STM32F405 - cek pin PA0-PA7 = CH0-CH7, PC0-PC5 = CH10-CH15
-//
-// 2. UKUR gain aktual op-amp MCP6002-mu dengan multimeter
-//    lalu update CURRENT_AMP_GAIN di hw_kai.h
-//
-// 3. KONFIRMASI nilai shunt: skematik tulis 0.018R
-//    artinya 18 miliOhm, update CURRENT_SHUNT_RES = 0.018
-//    bukan 0.00018 seperti di komentar
-//
-// 4. IMPLEMENTASIKAN fault interrupt dari Trip_Signal
-//    dan SD1/SD2/SD3 di fungsi ini atau di irq_handlers.c
-//
-// 5. TEST dengan arus rendah dulu (5-10A) sebelum full power
-// =========================================================
+        palSetPadMode(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN,
+                PAL_STM32_OTYPE_OPENDRAIN |
+                PAL_STM32_OSPEED_MID1 |
+                PAL_STM32_PUDR_PULLUP);
+        palSetPadMode(HW_I2C_SDA_PORT, HW_I2C_SDA_PIN,
+                PAL_STM32_OTYPE_OPENDRAIN |
+                PAL_STM32_OSPEED_MID1 |
+                PAL_STM32_PUDR_PULLUP);
+
+        palSetPad(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN);
+        palSetPad(HW_I2C_SDA_PORT, HW_I2C_SDA_PIN);
+        chThdSleep(1);
+
+        for (int i = 0; i < 16; i++) {
+            palClearPad(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN);
+            chThdSleep(1);
+            palSetPad(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN);
+            chThdSleep(1);
+        }
+
+        palClearPad(HW_I2C_SDA_PORT, HW_I2C_SDA_PIN);
+        chThdSleep(1);
+        palClearPad(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN);
+        chThdSleep(1);
+        palSetPad(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN);
+        chThdSleep(1);
+        palSetPad(HW_I2C_SDA_PORT, HW_I2C_SDA_PIN);
+
+        palSetPadMode(HW_I2C_SCL_PORT, HW_I2C_SCL_PIN,
+                PAL_MODE_ALTERNATE(HW_I2C_GPIO_AF) |
+                PAL_STM32_OTYPE_OPENDRAIN |
+                PAL_STM32_OSPEED_MID1 |
+                PAL_STM32_PUDR_PULLUP);
+        palSetPadMode(HW_I2C_SDA_PORT, HW_I2C_SDA_PIN,
+                PAL_MODE_ALTERNATE(HW_I2C_GPIO_AF) |
+                PAL_STM32_OTYPE_OPENDRAIN |
+                PAL_STM32_OSPEED_MID1 |
+                PAL_STM32_PUDR_PULLUP);
+
+        HW_I2C_DEV.state = I2C_STOP;
+        i2cStart(&HW_I2C_DEV, &i2cfg);
+
+        i2cReleaseBus(&HW_I2C_DEV);
+    }
+}
